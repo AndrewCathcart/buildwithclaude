@@ -1,10 +1,15 @@
 import { db } from '@/lib/db/client'
-import { plugins, skills, marketplaces } from '@/lib/db/schema'
+import { plugins, marketplaces } from '@/lib/db/schema'
 import { getGitHubClient } from '@/lib/github/client'
 import { eq, and, sql, inArray } from 'drizzle-orm'
 import { z } from 'zod'
 import { expandSkillCollection } from './skill-expander'
-import { resolveMarketplaceSkills } from './marketplace-skills'
+import { resolveMarketplaceSkills, skillPluginNamespace } from './marketplace-skills'
+import {
+  replaceMarketplaceSkillRows,
+  syncDeclaredSkillPlugins,
+  type DeclaredSkillPluginInsert,
+} from './declared-skill-store'
 
 // Plugin schema for GitHub marketplace data
 const PluginSchema = z.object({
@@ -84,9 +89,10 @@ type SkillUpsertRecord = {
 /**
  * Fetch plugins from GitHub repository marketplace.json
  */
-async function fetchGitHubMarketplacePlugins(repoFullName: string): Promise<Plugin[]> {
+async function fetchGitHubMarketplacePlugins(repoFullName: string): Promise<{ plugins: Plugin[]; foundManifest: boolean }> {
   const github = getGitHubClient()
   const plugins: Plugin[] = []
+  let foundManifest = false
 
   // Try standard paths for marketplace.json
   const paths = [
@@ -103,6 +109,7 @@ async function fetchGitHubMarketplacePlugins(repoFullName: string): Promise<Plug
 
       // Handle different formats
       if (data.plugins && Array.isArray(data.plugins)) {
+        foundManifest = true
         // Standard marketplace.json format
         for (const plugin of data.plugins) {
           plugins.push({
@@ -123,7 +130,8 @@ async function fetchGitHubMarketplacePlugins(repoFullName: string): Promise<Plug
           })
         }
         break
-      } else if (data.subagents || data.commands || data.hooks) {
+      } else if (data.subagents || data.commands || data.hooks || data.skills) {
+        foundManifest = true
         // buildwithclaude registry.json format
         for (const subagent of data.subagents || []) {
           if (!subagent.name) {
@@ -249,7 +257,7 @@ async function fetchGitHubMarketplacePlugins(repoFullName: string): Promise<Plug
     }
   }
 
-  return plugins
+  return { plugins, foundManifest }
 }
 
 /**
@@ -296,6 +304,9 @@ export async function indexPlugins(
 
   const pluginRecords: PluginUpsertRecord[] = []
   const skillRecords: SkillUpsertRecord[] = []
+  const declaredSkillPlugins: DeclaredSkillPluginInsert[] = []
+  const declaredSkillNamespaces = new Set<string>()
+  const refreshedMarketplaceIds: string[] = []
   const collectionNamespaces = new Set<string>()
   const changedUpdates: Array<{ id: string; pluginCount: number; sourcePushedAt: Date | null }> = []
   const bumpIds: string[] = [] // unchanged / skipped / failed → bulk last_indexed_at bump
@@ -325,10 +336,15 @@ export async function indexPlugins(
       failed += r.failed
       pluginRecords.length = 0
     }
-    if (skillRecords.length) {
-      skillsInserted += await batchUpsertSkills(skillRecords)
+    if (declaredSkillPlugins.length || refreshedMarketplaceIds.length) {
+      indexed += await syncDeclaredSkillPlugins(refreshedMarketplaceIds, declaredSkillPlugins)
+      declaredSkillPlugins.length = 0
+    }
+    if (skillRecords.length || refreshedMarketplaceIds.length) {
+      skillsInserted += await replaceMarketplaceSkillRows(refreshedMarketplaceIds, skillRecords)
       skillRecords.length = 0
     }
+    refreshedMarketplaceIds.length = 0
     // Deactivate parent collection entries that were expanded into individual skills.
     for (const ns of collectionNamespaces) {
       try {
@@ -415,7 +431,7 @@ export async function indexPlugins(
 
     // Changed (or first index): fetch + expand, accumulate for batch upsert.
     try {
-      const fetchedPlugins = await fetchGitHubMarketplacePlugins(repoPath)
+      const { plugins: fetchedPlugins, foundManifest } = await fetchGitHubMarketplacePlugins(repoPath)
       const expandedPlugins: Plugin[] = []
 
       for (const plugin of fetchedPlugins) {
@@ -489,12 +505,42 @@ export async function indexPlugins(
           const declaredSkills = await resolveMarketplaceSkills(
             plugin, repoPath, (repo, path) => github.fetchFileContent(repo, path),
           )
+          const resolvedCount = declaredSkills.filter(skill => skill.resolved).length
+          if (resolvedCount > 0) {
+            console.log(`Resolved ${resolvedCount} SKILL.md skills for ${plugin.name}`)
+          }
           for (const skill of declaredSkills) {
+            if (!skill.slug) continue
             skillRecords.push({
-              ...skill,
+              name: skill.name,
+              slug: skill.slug,
+              description: skill.description,
+              category: skill.category,
               marketplaceId: marketplace.id,
               marketplaceName: marketplace.displayName,
               repository: plugin.gitUrl || marketplace.repository,
+              lastIndexedAt: now,
+            })
+            if (!skill.resolved) continue
+            const namespace = skillPluginNamespace(plugin.namespace, plugin.name, skill.slug)
+            if (declaredSkillNamespaces.has(namespace)) continue
+            declaredSkillNamespaces.add(namespace)
+            declaredSkillPlugins.push({
+              name: skill.name,
+              namespace,
+              slug: skill.slug,
+              marketplaceId: marketplace.id,
+              marketplaceName: marketplace.displayName,
+              repository: plugin.gitUrl || marketplace.repository,
+              description: skill.description,
+              version: plugin.version,
+              author: plugin.author || plugin.namespace,
+              categories: skill.category ? [skill.category] : [],
+              keywords: plugin.keywords || [],
+              installCommand: `npx skills add ${repoPath}`,
+              stars: plugin.stars ?? 0,
+              content: skill.content,
+              sourcePath: skill.sourcePath,
               lastIndexedAt: now,
             })
           }
@@ -502,6 +548,7 @@ export async function indexPlugins(
       }
 
       reindexed++
+      if (foundManifest) refreshedMarketplaceIds.push(marketplace.id)
       changedUpdates.push({
         id: marketplace.id,
         pluginCount: expandedPlugins.length,
@@ -577,26 +624,6 @@ async function batchUpsertPlugins(
 }
 
 /**
- * Batch-insert skill records (collection skills referenced by name).
- */
-async function batchUpsertSkills(
-  records: SkillUpsertRecord[],
-  chunkSize = 100,
-): Promise<number> {
-  let inserted = 0
-  for (let i = 0; i < records.length; i += chunkSize) {
-    const batch = records.slice(i, i + chunkSize)
-    try {
-      await db.insert(skills).values(batch).onConflictDoNothing()
-      inserted += batch.length
-    } catch (error) {
-      console.error('Batch skill insert failed:', error)
-    }
-  }
-  return inserted
-}
-
-/**
  * Create URL-safe slug from name
  */
 function createSlug(name: string): string {
@@ -663,7 +690,12 @@ export async function indexMarketplacePlugins(marketplaceId: string): Promise<Pl
   try {
     // Fetch plugins from GitHub repository
     const repoPath = mp.repository.replace('https://github.com/', '')
-    const fetchedPlugins = await fetchGitHubMarketplacePlugins(repoPath)
+    const github = getGitHubClient()
+    const now = new Date()
+    const skillRows: SkillUpsertRecord[] = []
+    const skillPlugins: DeclaredSkillPluginInsert[] = []
+    const skillNamespaces = new Set<string>()
+    const { plugins: fetchedPlugins, foundManifest } = await fetchGitHubMarketplacePlugins(repoPath)
 
     for (const plugin of fetchedPlugins) {
       try {
@@ -705,9 +737,55 @@ export async function indexMarketplacePlugins(marketplaceId: string): Promise<Pl
           })
 
         indexed++
+
+        if (plugin.skills && plugin.skills.length > 0) {
+          const declaredSkills = await resolveMarketplaceSkills(
+            plugin, repoPath, (repo, path) => github.fetchFileContent(repo, path),
+          )
+          for (const skill of declaredSkills) {
+            if (!skill.slug) continue
+            skillRows.push({
+              name: skill.name,
+              slug: skill.slug,
+              description: skill.description,
+              category: skill.category,
+              marketplaceId: mp.id,
+              marketplaceName: mp.displayName,
+              repository: plugin.gitUrl || mp.repository,
+              lastIndexedAt: now,
+            })
+            if (!skill.resolved) continue
+            const namespace = skillPluginNamespace(plugin.namespace, plugin.name, skill.slug)
+            if (skillNamespaces.has(namespace)) continue
+            skillNamespaces.add(namespace)
+            skillPlugins.push({
+              name: skill.name,
+              namespace,
+              slug: skill.slug,
+              marketplaceId: mp.id,
+              marketplaceName: mp.displayName,
+              repository: plugin.gitUrl || mp.repository,
+              description: skill.description,
+              version: plugin.version,
+              author: plugin.author || plugin.namespace,
+              categories: skill.category ? [skill.category] : [],
+              keywords: plugin.keywords || [],
+              installCommand: `npx skills add ${repoPath}`,
+              stars: plugin.stars ?? 0,
+              content: skill.content,
+              sourcePath: skill.sourcePath,
+              lastIndexedAt: now,
+            })
+          }
+        }
       } catch {
         failed++
       }
+    }
+
+    if (foundManifest) {
+      indexed += await syncDeclaredSkillPlugins([mp.id], skillPlugins)
+      await replaceMarketplaceSkillRows([mp.id], skillRows)
     }
 
     await db

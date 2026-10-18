@@ -10,6 +10,7 @@ const PluginSchema = z
     version: z.string().optional(),
     category: z.string().optional(),
     skills: z.array(z.string()).optional(),
+    source: z.unknown().optional(),
   })
   .passthrough() // Allow additional fields
 

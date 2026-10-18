@@ -79,7 +79,7 @@ export const scheduledPluginsIndex = schedules.task({
   run: async (payload) => {
     console.log(`Plugins indexing started at ${payload.timestamp}`)
     const result = await indexPlugins()
-    await reindexSearch(['plugin'])
+    await reindexSearch(['plugin', 'skill'])
     return { ...result, scheduledAt: payload.timestamp }
   },
 })

@@ -7,6 +7,7 @@ import matter from 'gray-matter'
 import { getGitHubClient, type GitHubTreeEntry } from '@/lib/github/client'
 import { parseMarketplaceJson } from './parser'
 import { normalizeSkillCategory } from '@/lib/category-utils'
+import { resolveMarketplaceSkills } from './marketplace-skills'
 
 export interface AnalyzedSkill {
   name: string
@@ -228,14 +229,42 @@ async function tryMarketplaceJson(
       const parsed = parseMarketplaceJson(content, repoFullName)
 
       if (parsed && parsed.plugins) {
-        return parsed.plugins.map(p => ({
-          name: truncate(p.name, MAX_NAME_LENGTH),
-          slug: createSlug(p.name),
-          description: truncate(p.description || `Plugin from ${repoFullName}`, MAX_DESCRIPTION_LENGTH),
-          category: normalizeSkillCategory(p.category || null),
-          installCommand: `npx skills add ${repoFullName}`,
-          source: path.includes('marketplace') ? 'marketplace-json' as const : 'plugin-json' as const,
-        }))
+        const skills: AnalyzedSkill[] = []
+        const manifestSource = path.includes('marketplace') ? 'marketplace-json' as const : 'plugin-json' as const
+        for (const plugin of parsed.plugins) {
+          if (skills.length >= MAX_SKILLS_PER_REPO) break
+          const declared = await resolveMarketplaceSkills(
+            plugin,
+            repoFullName,
+            (repo, filePath) => github.fetchFileContent(repo, filePath),
+          )
+          const resolved = declared.filter(skill => skill.resolved && skill.slug)
+          if (resolved.length === 0) {
+            skills.push({
+              name: truncate(plugin.name, MAX_NAME_LENGTH),
+              slug: createSlug(plugin.name),
+              description: truncate(plugin.description || `Plugin from ${repoFullName}`, MAX_DESCRIPTION_LENGTH),
+              category: normalizeSkillCategory(plugin.category || null),
+              installCommand: `npx skills add ${repoFullName}`,
+              source: manifestSource,
+            })
+            continue
+          }
+          for (const skill of resolved) {
+            if (skills.length >= MAX_SKILLS_PER_REPO) break
+            skills.push({
+              name: truncate(skill.name, MAX_NAME_LENGTH),
+              slug: skill.slug,
+              description: truncate(skill.description, MAX_DESCRIPTION_LENGTH),
+              category: normalizeSkillCategory(skill.category || null),
+              installCommand: `npx skills add ${repoFullName}`,
+              content: skill.content,
+              sourcePath: skill.sourcePath,
+              source: 'skill-md',
+            })
+          }
+        }
+        return skills
       }
     } catch {
       continue

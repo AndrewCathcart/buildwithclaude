@@ -1,11 +1,18 @@
 import { task, logger } from "@trigger.dev/sdk/v3";
 import { db } from "@/lib/db/client";
-import { plugins, skills, marketplaces } from "@/lib/db/schema";
+import { plugins, marketplaces } from "@/lib/db/schema";
 import { getGitHubClient } from "@/lib/github/client";
 import { eq, and, sql } from "drizzle-orm";
 import { z } from "zod";
 import { expandSkillCollection } from "@/lib/indexer/skill-expander";
 import { smartCategorizeSkill } from "@/lib/category-utils";
+import { resolveMarketplaceSkills, skillPluginNamespace } from "@/lib/indexer/marketplace-skills";
+import {
+  replaceMarketplaceSkillRows,
+  syncDeclaredSkillPlugins,
+  type DeclaredSkillPluginInsert,
+  type DeclaredSkillRowInsert,
+} from "@/lib/indexer/declared-skill-store";
 
 // Plugin schema for GitHub marketplace data
 const PluginSchema = z.object({
@@ -17,6 +24,7 @@ const PluginSchema = z.object({
   category: z.string().optional().nullable(),
   keywords: z.array(z.string()).optional().nullable(),
   skills: z.array(z.string()).optional().nullable(),
+  source: z.union([z.string(), z.record(z.string(), z.unknown())]).optional().nullable(),
   author: z.string().optional().nullable(),
   gitUrl: z.string().optional().nullable(),
   stars: z.number().optional().default(0),
@@ -54,9 +62,10 @@ type Plugin = z.infer<typeof PluginSchema>;
  */
 async function fetchGitHubMarketplacePlugins(
   repoFullName: string
-): Promise<Plugin[]> {
+): Promise<{ plugins: Plugin[]; foundManifest: boolean }> {
   const github = getGitHubClient();
   const foundPlugins: Plugin[] = [];
+  let foundManifest = false;
 
   // Try standard paths for marketplace.json
   const paths = [
@@ -73,6 +82,7 @@ async function fetchGitHubMarketplacePlugins(
 
       // Handle different formats
       if (data.plugins && Array.isArray(data.plugins)) {
+        foundManifest = true;
         // Standard marketplace.json format
         for (const plugin of data.plugins) {
           foundPlugins.push({
@@ -84,6 +94,7 @@ async function fetchGitHubMarketplacePlugins(
             category: plugin.category,
             keywords: plugin.keywords || plugin.tags,
             skills: plugin.skills,
+            source: plugin.source ?? null,
             author: typeof plugin.author === 'object'
               ? plugin.author?.name || repoFullName.split("/")[0]
               : plugin.author || repoFullName.split("/")[0],
@@ -94,7 +105,8 @@ async function fetchGitHubMarketplacePlugins(
           });
         }
         break;
-      } else if (data.subagents || data.commands || data.hooks) {
+      } else if (data.subagents || data.commands || data.hooks || data.skills) {
+        foundManifest = true;
         // buildwithclaude registry.json format
         for (const subagent of data.subagents || []) {
           foundPlugins.push({
@@ -202,7 +214,7 @@ async function fetchGitHubMarketplacePlugins(
     }
   }
 
-  return foundPlugins;
+  return { plugins: foundPlugins, foundManifest };
 }
 
 /**
@@ -307,37 +319,6 @@ async function batchUpsertPlugins(
   return { indexed, failed };
 }
 
-/**
- * Batch upsert skills to database
- */
-async function batchUpsertSkills(
-  skillRecords: Array<{
-    name: string;
-    slug: string;
-    marketplaceId: string;
-    marketplaceName: string;
-    repository: string;
-    description: string;
-    category: string | null | undefined;
-    lastIndexedAt: Date;
-  }>,
-  batchSize = 100
-): Promise<number> {
-  let inserted = 0;
-
-  for (let i = 0; i < skillRecords.length; i += batchSize) {
-    const batch = skillRecords.slice(i, i + batchSize);
-    try {
-      await db.insert(skills).values(batch).onConflictDoNothing();
-      inserted += batch.length;
-    } catch (error) {
-      logger.error(`Batch skill insert failed`, { error });
-    }
-  }
-
-  return inserted;
-}
-
 // Payload type for the task (optional parameters)
 export type IndexPluginsPayload = {
   marketplaceId?: string; // Optional: index only a specific marketplace
@@ -386,19 +367,13 @@ export const indexPluginsTask = task({
       lastIndexedAt: Date;
     }> = [];
 
-    const skillRecords: Array<{
-      name: string;
-      slug: string;
-      marketplaceId: string;
-      marketplaceName: string;
-      repository: string;
-      description: string;
-      category: string | null | undefined;
-      lastIndexedAt: Date;
-    }> = [];
+    const skillRecords: DeclaredSkillRowInsert[] = [];
+    const declaredSkillPlugins: DeclaredSkillPluginInsert[] = [];
+    const declaredSkillNamespaces = new Set<string>();
 
     let skipped = 0;
     const marketplacePluginCounts: Record<string, number> = {};
+    const manifestMarketplaceIds: string[] = [];
 
     // Fetch plugins from all marketplaces
     for (const marketplace of activeMarketplaces) {
@@ -420,7 +395,7 @@ export const indexPluginsTask = task({
           "https://github.com/",
           ""
         );
-        const fetchedPlugins = await fetchGitHubMarketplacePlugins(repoPath);
+        const { plugins: fetchedPlugins, foundManifest } = await fetchGitHubMarketplacePlugins(repoPath);
 
         logger.info(
           `Fetched ${fetchedPlugins.length} plugins from ${marketplace.displayName}`
@@ -452,23 +427,54 @@ export const indexPluginsTask = task({
             lastIndexedAt: new Date(),
           });
 
-          // Collect skill records
           if (plugin.skills && plugin.skills.length > 0) {
-            for (const skillName of plugin.skills) {
-              const skillSlug = createSlug(skillName);
+            const declared = await resolveMarketplaceSkills(
+              plugin,
+              repoPath,
+              (repo, path) => getGitHubClient().fetchFileContent(repo, path),
+            );
+            const resolvedCount = declared.filter((skill) => skill.resolved).length;
+            if (resolvedCount > 0) {
+              logger.info(`Resolved ${resolvedCount} SKILL.md skills for ${plugin.name}`);
+            }
+            for (const skill of declared) {
+              if (!skill.slug) continue;
               skillRecords.push({
-                name: skillName,
-                slug: skillSlug,
+                name: skill.name,
+                slug: skill.slug,
                 marketplaceId: marketplace.id,
                 marketplaceName: marketplace.displayName,
                 repository: plugin.gitUrl || marketplace.repository,
-                description: `Skill from ${plugin.name}`,
-                category: smartCategorizeSkill(plugin.category, skillName, plugin.description || ''),
+                description: skill.description,
+                category: skill.category,
+                lastIndexedAt: new Date(),
+              });
+              if (!skill.resolved) continue;
+              const namespace = skillPluginNamespace(plugin.namespace, plugin.name, skill.slug);
+              if (declaredSkillNamespaces.has(namespace)) continue;
+              declaredSkillNamespaces.add(namespace);
+              declaredSkillPlugins.push({
+                name: skill.name,
+                namespace,
+                slug: skill.slug,
+                marketplaceId: marketplace.id,
+                marketplaceName: marketplace.displayName,
+                repository: plugin.gitUrl || marketplace.repository,
+                description: skill.description,
+                version: plugin.version,
+                author: plugin.author || plugin.namespace,
+                categories: skill.category ? [skill.category] : [],
+                keywords: plugin.keywords || [],
+                installCommand: `npx skills add ${repoPath}`,
+                stars: plugin.stars || 0,
+                content: skill.content,
+                sourcePath: skill.sourcePath,
                 lastIndexedAt: new Date(),
               });
             }
           }
         }
+        if (foundManifest) manifestMarketplaceIds.push(marketplace.id);
       } catch (error) {
         logger.error(`Failed to fetch from ${marketplace.displayName}`, {
           error,
@@ -583,8 +589,14 @@ export const indexPluginsTask = task({
       }
     }
 
-    // Batch insert all skills
-    const skillsInserted = await batchUpsertSkills(skillRecords);
+    const declaredInserted = await syncDeclaredSkillPlugins(
+      manifestMarketplaceIds,
+      declaredSkillPlugins
+    );
+    const skillsInserted = await replaceMarketplaceSkillRows(
+      manifestMarketplaceIds,
+      skillRecords
+    );
 
     // Update marketplace plugin counts
     for (const [marketplaceId, count] of Object.entries(
@@ -632,12 +644,13 @@ export const indexPluginsTask = task({
       failed,
       skipped,
       skillsInserted,
+      declaredSkillPlugins: declaredInserted,
       searchReindexed,
       durationMs,
     });
 
     return {
-      indexed,
+      indexed: indexed + declaredInserted,
       failed,
       skipped,
       skillsInserted,

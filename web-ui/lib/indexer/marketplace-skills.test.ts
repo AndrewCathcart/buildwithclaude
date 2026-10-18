@@ -1,6 +1,16 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveMarketplaceSkills } from './marketplace-skills.ts'
+import { resolveMarketplaceSkills, skillPluginNamespace } from './marketplace-skills.ts'
+
+describe('skillPluginNamespace', () => {
+  it('uses @owner/skill and disambiguates a clash with the parent plugin', () => {
+    assert.equal(skillPluginNamespace('getrecast', 'recast', 'forecaster-api'), '@getrecast/forecaster-api')
+    assert.equal(
+      skillPluginNamespace('@getrecast', 'forecaster-api', 'forecaster-api'),
+      '@getrecast/forecaster-api/forecaster-api',
+    )
+  })
+})
 
 describe('resolveMarketplaceSkills', () => {
   it('reads SKILL.md relative to the plugin source (issue #315)', async () => {
@@ -15,12 +25,13 @@ describe('resolveMarketplaceSkills', () => {
       return '---\nname: forecaster-api\ndescription: Predict outcomes from a budget.\n---\n# Forecaster'
     })
 
-    assert.deepEqual(result, [{
-      name: 'forecaster-api',
-      slug: 'forecaster-api',
-      description: 'Predict outcomes from a budget.',
-      category: 'analytics',
-    }])
+    assert.equal(result[0].name, 'forecaster-api')
+    assert.equal(result[0].slug, 'forecaster-api')
+    assert.equal(result[0].description, 'Predict outcomes from a budget.')
+    assert.equal(result[0].category, 'analytics')
+    assert.equal(result[0].resolved, true)
+    assert.equal(result[0].sourcePath, 'plugins/recast/skills/forecaster-api/SKILL.md')
+    assert.match(result[0].content || '', /# Forecaster/)
   })
 
   it('supports root plugins and explicit SKILL.md paths', async () => {
@@ -47,6 +58,7 @@ describe('resolveMarketplaceSkills', () => {
     assert.deepEqual(result, [{
       name: 'code-review', slug: 'code-review',
       description: 'Skill from example', category: undefined,
+      resolved: false,
     }])
   })
 
