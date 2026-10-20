@@ -3887,6 +3887,30 @@
         "repo": "KuudoAI/skills",
         "sha": "d2b89c3776b48b4522f9d8d8fe5c18a89ba5ce60"
       }
+    },
+    {
+      "name": "pixelbolt",
+      "description": "Pixel art and sprite animation from editable JSON recipes, with particle and fluid effects; exports PNG/GIF/APNG and atlases.",
+      "version": "0.9.0",
+      "author": {
+        "name": "skulitom",
+        "url": "https://github.com/skulitom"
+      },
+      "homepage": "https://github.com/skulitom/Pixelbolt#readme",
+      "repository": "https://github.com/skulitom/pixelbolt-plugin",
+      "license": "MIT",
+      "keywords": [
+        "pixel-art",
+        "sprites",
+        "animation",
+        "mcp"
+      ],
+      "category": "creative",
+      "source": {
+        "source": "github",
+        "repo": "skulitom/pixelbolt-plugin",
+        "sha": "01a11749d74a33a35ab02a3a92f4035dfa60ffb8"
+      }
     }
   ]
 }
