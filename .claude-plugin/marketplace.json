@@ -3941,7 +3941,7 @@
     {
       "name": "deacon",
       "description": "Install the Deacon AI support widget on a site or app, tell it who is signed in, and send it goals such as sign ups and upgrades.",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "author": {
         "name": "Deacon",
         "url": "https://heydeacon.com"
@@ -3959,7 +3959,7 @@
       "source": {
         "source": "github",
         "repo": "heydeacon/skills",
-        "sha": "47620319f2d57d9ab982a9b39abb2d0ff1bce600"
+        "sha": "8ba690e94643c48134b82d841856d14dffceed31"
       }
     }
   ]
