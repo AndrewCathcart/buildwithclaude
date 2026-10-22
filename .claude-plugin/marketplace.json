@@ -3937,6 +3937,30 @@
         "repo": "whereisdw/lidnight-claude-plugin",
         "sha": "f54adf0da9c4fe31ff24631a3d7d0e3e8890dda2"
       }
+    },
+    {
+      "name": "deacon",
+      "description": "Install the Deacon AI support widget on a site or app, tell it who is signed in, and send it goals such as sign ups and upgrades.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Deacon",
+        "url": "https://heydeacon.com"
+      },
+      "homepage": "https://heydeacon.com",
+      "repository": "https://github.com/heydeacon/skills",
+      "license": "MIT",
+      "keywords": [
+        "customer-support",
+        "chat-widget",
+        "ai-support",
+        "analytics"
+      ],
+      "category": "development",
+      "source": {
+        "source": "github",
+        "repo": "heydeacon/skills",
+        "sha": "47620319f2d57d9ab982a9b39abb2d0ff1bce600"
+      }
     }
   ]
 }
